@@ -23,8 +23,8 @@
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
-#define SCREEN_X 1024
-#define SCREEN_Y 768
+#define SCREEN_X 512
+#define SCREEN_Y 512
 #define FPS_UPDATE 500
 #define TITLE "Lenia"
 
@@ -32,6 +32,16 @@
 #define GPU_MODE 2
 #define OPENGL_GPU_MODE 3
 
+int width_grid = 256;
+int height_grid = 256;
+
+int block_dim_x = 16;
+int block_dim_y = 16;
+int grid_dim_x = (width_grid + block_dim_x - 1) / block_dim_x;
+int grid_dim_y = (height_grid + block_dim_y - 1) / block_dim_y;
+
+float4* d_grid1, * d_grid2;
+bool tab_1_used = true;
 
 GLuint imageTex;
 GLuint imageBuffer;
@@ -51,7 +61,7 @@ int frame = 0;
 int timebase = 0;
 
 float4* pixels2;
-int size = SCREEN_X * SCREEN_Y * sizeof(float4);
+int size = width_grid * height_grid * sizeof(float4);
 
 #define INF 2e10f
 
@@ -59,20 +69,44 @@ unsigned long long seed = time(NULL); // or any other unique seed value
 
 // Lenia parameters
 
-int R = 1; // because of the CPU capabilities, can not be greater
-int T = 10;
-float mu = 0.15f;
-float omega = 0.016f;
-int alpha = 4;
+#define R 10
+#define T 10
+#define mu 0.15f
+#define omega 0.016f
+#define alpha 4
 #define B 1 // rank for the pics
 
 float4* lenia_pixels;
 
+#define checkCudaErrors(err) __checkCudaErrors(err, __FILE__, __LINE__)
+
+inline void __checkCudaErrors
+(cudaError err, const char* file, const int line)
+{
+	if (err != cudaSuccess)
+	{
+		fprintf(stderr, "%s(%i) : CUDA Runtime API error %d: %s.\n",
+			file, line, (int)err, cudaGetErrorString(err));
+		system("pause");
+		exit(1);
+	}
+}
+
+float4* zeroPixels() {
+	float4* p = (float4*)malloc(size);
+	for (int i = 0; i < width_grid * height_grid;i++) {
+		p[i].x = 0.0f;
+		p[i].y = 0.0f;
+		p[i].z = 0.0f;
+		p[i].w = 1.0f;
+	}
+	return p;
+}
 
 float4* randomPixels() {
-	float4* p = (float4*)malloc(SCREEN_X * SCREEN_Y * sizeof(float4));
-	for (int i = 0; i < SCREEN_X * SCREEN_Y; i++) {
-		if (i % (10 * SCREEN_X) == 0) srand(i);
+	float4* p = (float4*)malloc(size);
+	for (int i = 0; i < width_grid * height_grid; i++) {
+		if (i % (10 * width_grid) == 0) srand(i);
 		float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
 		p[i].x = 0.0f;
 		p[i].y = random_value; 
@@ -82,14 +116,33 @@ float4* randomPixels() {
 	return p;
 }
 
-float4* zeroPixels() {
+float4* randomPixelsCenter() {
 	float4* p = (float4*)malloc(size);
-	for (int i = 0; i < SCREEN_X * SCREEN_Y;i++) {
-		p[i].x = 0.0f;
-		p[i].y = 0.0f;
-		p[i].z = 0.0f;
-		p[i].w = 1.0f;
+	for (int i = 3 * height_grid/8; i < 5*height_grid/8; i++) {
+		for (int j = 3 * width_grid / 8; j < 5 * width_grid / 8; j++) {
+			int index = i * width_grid + j;
+
+			if (index % (10 * width_grid) == 0) srand(index);
+			float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
+			p[index].x = 0.0f;
+			p[index].y = random_value;
+			p[index].z = 0.0f;
+			p[index].w = 1.0f;
+		}
+		
 	}
+	return p;
+}
+
+float4* orbium()
+{	
+	float4* p = zeroPixels();
+	p[6].y = 0.1f;
+	p[7].y = 0.14f;
+	p[8].y = 0.1f;
+	p[11].y = 0.03f;
+	p[12].y = 0.03f;
+	p[15].y = 0.3f;
 	return p;
 }
 
@@ -100,7 +153,7 @@ void initCPU()
 	// Intializes random number generator
 	srand((unsigned)time(&t));
 
-	lenia_pixels = randomPixels();
+	lenia_pixels = randomPixelsCenter();
 	pixels2 = zeroPixels();
 
 }
@@ -111,6 +164,29 @@ void cleanCPU()
 	free(pixels2);
 }
 
+
+void initGPU()
+{
+	time_t t;
+
+	// Intializes random number generator
+	srand((unsigned)time(&t));
+
+	lenia_pixels = randomPixels();
+	pixels2 = zeroPixels();
+	checkCudaErrors(cudaMalloc((void**)&d_grid1, size));
+	checkCudaErrors(cudaMalloc((void**)&d_grid2, size));
+
+}
+
+void cleanGPU()
+{
+	free(lenia_pixels);
+	free(pixels2);
+	cudaFree(d_grid1);
+	cudaFree(d_grid2);
+}
+
 // ------------------------- LENIA -------------------------------------------------------------------------------------
 
 /*
@@ -118,9 +194,15 @@ void cleanCPU()
 	pre-condition : r between 0 and 1
 	post-condition : return value between O and 1
 */
-float kernel_core_exp(float r)
+__host__ __device__ float kernel_core_exp(float r)
 {
 	return exp(alpha - (alpha / (4 * r * (1 - r))));
+}
+
+__host__ __device__ float growth_function_exp(float u)
+{
+	float dividende = (2.0f * omega * omega);
+	return 2.0f * exp(-((u - mu) * (u - mu)) / dividende) - 1.0f;
 }
 
 /*
@@ -143,7 +225,7 @@ float kernel_core_exp(float r)
 	pre-condition : n in the neighbourhood, at the indexes i and j
 	post-condition : 
 */
-float normalized_kernel(int x, int y, float beta[B])
+__host__ __device__ float normalized_kernel(int x, int y, float beta[B], int width_grid, int height_grid)
 {
 	float norm_n = sqrt(x*x + y*y);
 	float Ks_val = kernel_core_exp(norm_n); //kernel_shell(norm_n, beta)
@@ -153,8 +235,8 @@ float normalized_kernel(int x, int y, float beta[B])
 	for (int i = x-R; i <= x+R;i++) {
 		for (int j = y-R; j <= y+R;j++) {
 			if (i != x || j != y) {
-				int wrappedI = (i + SCREEN_Y) % SCREEN_Y;
-				int wrappedJ = (j + SCREEN_X) % SCREEN_X;
+				int wrappedI = (i + height_grid) % height_grid;
+				int wrappedJ = (j + width_grid) % width_grid;
 				sum += kernel_core_exp(sqrt(wrappedI * wrappedI + wrappedJ * wrappedJ));//kernel_shell(sqrt(wrappedI * wrappedI + wrappedJ * wrappedJ), beta);
 			}
 		}
@@ -168,20 +250,22 @@ float normalized_kernel(int x, int y, float beta[B])
 	Pre-condition : in the grid at indexes x and y
 	Post-condition : return value between 0 and 1
 */
-float potential_distribution(int x, int y)
+__host__ float potential_distribution(int x, int y, int width, int height)
 {
 	float sum = 0.0f;
 	float beta[B];
 	beta[0] = 1.0f;
 
+	float n_kernel = normalized_kernel(x, y, beta, width, height);
+
 	for (int i = x - R; i <= x + R;i++) {
 		for (int j = y - R; j <= y + R;j++) {
 			if (i != x || j != y) {
 				// calculate the wrapped index
-				int wrappedI = (i + SCREEN_Y) % SCREEN_Y;
-				int wrappedJ = (j + SCREEN_X) % SCREEN_X;
+				int wrappedI = (i + height_grid) % height_grid;
+				int wrappedJ = (j + width_grid) % width_grid;
 
-				sum += normalized_kernel(x, y, beta) * lenia_pixels[wrappedI * SCREEN_X + wrappedJ].y;
+				sum += n_kernel * lenia_pixels[wrappedI * width_grid + wrappedJ].y;
 			}
 		}
 	}
@@ -190,23 +274,18 @@ float potential_distribution(int x, int y)
 }
 
 
-float growth_function_exp(float u)
-{
-	float dividende = (2.0f * omega * omega);
-	return 2.0f * exp(-((u - mu) * (u - mu)) / dividende) - 1.0f;
-}
 
 void lenia_basic_CPU()
 {
 	// for each pixel
-	for (int i = 0; i < SCREEN_Y; i++) {
-		for (int j = 0; j < SCREEN_X; j++) {
-			float c_t = lenia_pixels[i * SCREEN_X + j].y; // field C at time step t
+	for (int i = 0; i < height_grid; i++) {
+		for (int j = 0; j < width_grid; j++) {
+			float c_t = lenia_pixels[i * width_grid + j].y; // field C at time step t
 			//printf("c_t = %f - ", c_t);
 			float c_tdt; // field C at time step t + delta(t) ; (delta (t) = 1/T)
 
 			// 1st step : convolution operation, multiplication with the kernel
-			float u_t = potential_distribution(i, j);
+			float u_t = potential_distribution(i, j, width_grid, height_grid);
 			//printf("u_t = %f - ", u_t);
 			// 2nd step : growth mapping
 			float g_t = growth_function_exp(u_t);
@@ -222,9 +301,100 @@ void lenia_basic_CPU()
 			//printf("c_tdt = %f\n", c_tdt);
 
 			// assign the value to a temporary table
-			pixels2[i * SCREEN_X + j].y = c_tdt;
+			pixels2[i * width_grid + j].y = c_tdt;
 		}
 	}
+}
+
+
+__global__ void lenia (float4* d_grid_old, float4* d_grid_new, int width, int height)
+{
+	int indexX = threadIdx.x + blockIdx.x * blockDim.x;
+	int indexY = threadIdx.y + blockIdx.y * blockDim.y;
+
+	if (indexX < width && indexY < height) {
+		int index = indexY * width + indexX;
+
+		float c_t = d_grid_old[index].y; // field C at time step t
+		float c_tdt; // field C at time step t + delta(t) ; (delta (t) = 1/T)
+
+		// 1st step : convolution operation, multiplication with the kernel
+
+		float sum = 0.0f;
+		float beta[B];
+		beta[0] = 1.0f;
+
+		float n_kernel = normalized_kernel(indexX, indexY, beta, width, height);
+
+		for (int i = indexX - R; i <= indexX + R;i++) {
+			for (int j = indexY - R; j <= indexY + R;j++) {
+				if (i != indexX || j != indexY) {
+					// calculate the wrapped index
+					int wrappedI = (i + height) % height;
+					int wrappedJ = (j + width) % width;
+
+					sum += n_kernel * d_grid_old[wrappedI * width + wrappedJ].y;
+				}
+			}
+		}
+		float u_t = sum;
+
+		// 2nd step : growth mapping
+		float g_t = growth_function_exp(u_t);
+
+		// 3rd step : add the growth to the existing value
+		float dt = 1.0f / float(T);
+		c_tdt = c_t + dt * g_t;
+
+		// 4th step : clip the result to be in range from 0 to 1
+		if (c_tdt < 0.0f) c_tdt = 0.0f;
+		if (c_tdt > 1.0f) c_tdt = 1.0f;
+
+		// assign the value
+		d_grid_new[index].y = c_tdt;
+	}
+}
+
+
+void lenia_basic_GPU()
+{
+	dim3 dimBlock(block_dim_x, block_dim_y);
+	dim3 dimGrid(grid_dim_x, grid_dim_y);
+
+	cudaError_t err;
+
+	if (tab_1_used)
+	{
+		// send lenia pixels to device
+		checkCudaErrors(cudaMemcpy(d_grid1, lenia_pixels, size, cudaMemcpyHostToDevice));
+
+		// do treatments
+		lenia << <dimGrid, dimBlock >> > (d_grid1, d_grid2, width_grid, height_grid);
+		cudaDeviceSynchronize();
+		err = cudaGetLastError();
+		if (err != cudaSuccess) {
+			printf("Error: % s\n", cudaGetErrorString(err));
+		}
+
+		// fetch grid 2
+		checkCudaErrors(cudaMemcpy(pixels2, d_grid2, size, cudaMemcpyDeviceToHost));
+	}
+	else {
+		// send lenia pixels to device
+		checkCudaErrors(cudaMemcpy(d_grid2, pixels2, size, cudaMemcpyHostToDevice));
+
+		// do treatments
+		lenia << <dimGrid, dimBlock >> > (d_grid2, d_grid1, width_grid, height_grid);
+		cudaDeviceSynchronize();
+		err = cudaGetLastError();
+		if (err != cudaSuccess) {
+			printf("Error: % s\n", cudaGetErrorString(err));
+		}
+
+		// fetch grid 1
+		checkCudaErrors(cudaMemcpy(lenia_pixels, d_grid1, size, cudaMemcpyDeviceToHost));
+	}
+
 }
 
 
@@ -238,7 +408,7 @@ void calculate() {
 		switch (mode)
 		{
 		case CPU_MODE: m = "CPU mode"; break;
-		//case GPU_MODE: m = "GPU mode - normal"; break;
+		case GPU_MODE: m = "GPU mode"; break;
 		//case OPENGL_GPU_MODE: m = "GPU mode - OpenGL interoperability"; break;
 		}
 		sprintf(t, "%s:  %s, %.2f FPS", TITLE, m, frame * 1000 / (float)(timecur - timebase));
@@ -253,7 +423,9 @@ void calculate() {
 		lenia_basic_CPU();
 		lenia_pixels = pixels2;
 		break;
-	//case GPU_MODE: bugsCPU(); break;
+	case GPU_MODE: 
+		lenia_basic_GPU(); 
+		break;
 	//case OPENGL_GPU_MODE: bugsCPU(); break;
 	}
 }
@@ -263,12 +435,47 @@ void idle()
 	glutPostRedisplay();
 }
 
+void draw_pixels_zoomed()
+{
+	// Calculate the size of each grid cell on the screen
+	int cell_size_x = SCREEN_X / width_grid;
+	int cell_size_y = SCREEN_Y / height_grid;
+
+	for (int i = 0; i < height_grid; i++)
+	{
+		for (int j = 0; j < width_grid; j++)
+		{
+			float4 color;
+			// Get the color of the current pixel in the grid
+			if (mode == GPU_MODE && !tab_1_used) {
+				color = pixels2[i * width_grid + j];
+			}
+			else {
+				color = lenia_pixels[i * width_grid + j];
+			}
+			
+
+			// Draw a rectangle representing the grid cell
+			glBegin(GL_QUADS);
+			glColor4f(color.y, color.y, color.y, color.w);
+			glVertex2i(j * cell_size_x, i * cell_size_y); // Top-left corner
+			glVertex2i((j + 1) * cell_size_x, i * cell_size_y); // Top-right corner
+			glVertex2i((j + 1) * cell_size_x, (i + 1) * cell_size_y); // Bottom-right corner
+			glVertex2i(j * cell_size_x, (i + 1) * cell_size_y); // Bottom-left corner
+			glEnd();
+		}
+	}
+}
+
 
 void render()
 {
 	calculate();
 
-	glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, lenia_pixels);
+	//glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, lenia_pixels);
+	draw_pixels_zoomed();
+
+	tab_1_used = !tab_1_used;
 
 	glutSwapBuffers();
 }
@@ -278,7 +485,7 @@ void clean()
 	switch (mode)
 	{
 	case CPU_MODE: cleanCPU(); break;
-	case GPU_MODE: cleanCPU(); break;
+	case GPU_MODE: cleanGPU(); break;
 	case OPENGL_GPU_MODE: cleanCPU(); break;
 	}
 
@@ -286,10 +493,12 @@ void clean()
 
 void init()
 {
+	tab_1_used = true;
+
 	switch (mode)
 	{
 	case CPU_MODE: initCPU(); break;
-	case GPU_MODE: initCPU(); break;
+	case GPU_MODE: initGPU(); break;
 	case OPENGL_GPU_MODE: initCPU(); break;
 	}
 }
@@ -323,7 +532,7 @@ void processNormalKeys(unsigned char key, int x, int y) {
 
 	if (key == 27) { clean(); exit(0); }
 	else if (key == '1') toggleMode(CPU_MODE);
-	//else if (key == '2') toggleMode(GPU_MODE);
+	else if (key == '2') toggleMode(GPU_MODE);
 	//else if (key == '3') toggleMode(OPENGL_GPU_MODE);
 }
 
