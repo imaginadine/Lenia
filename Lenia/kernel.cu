@@ -72,7 +72,7 @@ unsigned long long seed = time(NULL); // or any other unique seed value
 #define R 10
 #define T 10
 #define mu 0.15f
-#define omega 0.016f
+#define sigma 0.014f
 #define alpha 4
 #define B 1 // rank for the pics
 
@@ -108,6 +108,12 @@ float4* randomPixels() {
 	for (int i = 0; i < width_grid * height_grid; i++) {
 		if (i % (10 * width_grid) == 0) srand(i);
 		float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
+		float test_alive = (float)rand() / RAND_MAX;
+
+		if (test_alive < 0.77f) {
+			random_value = 0.0f;
+		}
+
 		p[i].x = 0.0f;
 		p[i].y = random_value; 
 		p[i].z = 0.0f;
@@ -134,7 +140,7 @@ float4* randomPixelsCenter() {
 	return p;
 }
 
-float4* orbium()
+float4* orbium() // pas complet du tout
 {	
 	float4* p = zeroPixels();
 	p[6].y = 0.1f;
@@ -146,6 +152,17 @@ float4* orbium()
 	return p;
 }
 
+float4* glider()
+{
+	float4* p = zeroPixels();
+	p[0 * width_grid + 1].y = 1.0f;
+	p[1 * width_grid + 2].y = 1.0f;
+	p[2 * width_grid + 0].y = 1.0f;
+	p[2 * width_grid + 1].y = 1.0f;
+	p[2 * width_grid + 2].y = 1.0f;
+	return p;
+}
+
 void initCPU()
 {
 	time_t t;
@@ -153,7 +170,7 @@ void initCPU()
 	// Intializes random number generator
 	srand((unsigned)time(&t));
 
-	lenia_pixels = randomPixelsCenter();
+	lenia_pixels = randomPixels();
 	pixels2 = zeroPixels();
 
 }
@@ -201,8 +218,36 @@ __host__ __device__ float kernel_core_exp(float r)
 
 __host__ __device__ float growth_function_exp(float u)
 {
-	float dividende = (2.0f * omega * omega);
+	float dividende = (2.0f * sigma * sigma);
 	return 2.0f * exp(-((u - mu) * (u - mu)) / dividende) - 1.0f;
+}
+
+// Like the Game of Life
+
+float kernel_core_step(float r)
+{
+	float k = 0.0f;
+	float q = 0.25f;
+	if (q <= r && r <= (1 - q)) {
+		k = 1.0f;
+	}
+	else if (r <= q) {
+		k = 0.5f;
+	}
+	return k;
+}
+
+float growth_function_step(float u) {
+	float l = u - mu;
+	if (l < 0.0f) {
+		l = -l;
+	}
+
+	float d = -1.0f;
+	if (l <= sigma) {
+		d = 1.0f;
+	}
+	return d;
 }
 
 /*
@@ -472,8 +517,12 @@ void render()
 {
 	calculate();
 
-	//glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, lenia_pixels);
-	draw_pixels_zoomed();
+	if (SCREEN_X == width_grid && SCREEN_Y == height_grid) {
+		glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, lenia_pixels);
+	}
+	else {
+		draw_pixels_zoomed();
+	}
 
 	tab_1_used = !tab_1_used;
 
