@@ -70,7 +70,7 @@ unsigned long long seed = time(NULL); // or any other unique seed value
 
 // Lenia parameters
 
-#define R 26
+#define R 13
 #define T 10
 #define mu 0.15f
 #define sigma 0.017f
@@ -114,9 +114,9 @@ float4* randomPixels() {
 		float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
 		float test_alive = (float)rand() / RAND_MAX;
 
-		/*if (test_alive < 0.5f) {
+		if (test_alive < 0.77f) {
 			random_value = 0.0f;
-		}*/
+		}
 
 		p[i].x = 0.0f;
 		p[i].y = random_value;
@@ -260,26 +260,6 @@ int emod(int a, int b)
 	return res;
 }
 
-double toric_distance(int x1, int y1, int x2, int y2, int width, int height) {
-	int dx = abs(x1 - x2);
-	int dy = abs(y1 - y2);
-
-	if (dx > width / 2) {
-		dx = width - dx;
-	}
-	if (dy > height / 2) {
-		dy = height - dy;
-	}
-
-	return sqrt(dx * dx + dy * dy);
-}
-
-bool is_in_neighborhood(int x, int y, int i, int j, int width, int height) { // OK
-	double distance = toric_distance(x, y, i, j, width, height);
-	bool val = distance <= R;
-	return val;
-}
-
 
 /*
 	kernel shell
@@ -297,7 +277,19 @@ float kernel_shell(float n) //OK
 	return peak_height * kernel_core_exp(u);
 }
 
+double toric_distance(int x1, int y1, int x2, int y2, int width, int height) {
+	int dx = abs(x1 - x2);
+	int dy = abs(y1 - y2);
 
+	if (dx > width / 2) {
+		dx = width - dx;
+	}
+	if (dy > height / 2) {
+		dy = height - dy;
+	}
+
+	return sqrt(dx * dx + dy * dy);
+}
 /*
 	Normalization of the kernel
 	pre-condition : n in the neighbourhood, at the indexes i and j
@@ -330,19 +322,12 @@ void init_kernel() {
 	}
 }
 
-float init_k_s_norm()
-{
+float init_k_s_norm() {
 	float acc = 0;
-	int center_x = width_grid / 2;
-	int center_y = height_grid / 2;
-
-	for (int i = 0; i < height_grid; i++)
-	{
-		for (int j = 0; j < width_grid; j++)
-		{
-			float r = toric_distance(center_x, center_y, i, j, width_grid, height_grid) / R;
-			if (toric_distance(center_x, center_y, i, j, width_grid, height_grid) <= R)
-			{
+	for (int i = -R; i <= R; i++) {
+		for (int j = -R; j <= R; j++) {
+			float r = sqrt(i * i + j * j) / R;
+			if (r <= 1.0f) {  // within the radius
 				acc += kernel_shell(r);
 			}
 		}
@@ -355,13 +340,13 @@ void initCPU()
 {
 	time_t t;
 	beta[0] = 1.0f;
-	//beta[1] = 1.0f;
-	//beta[2] = 1.0f;
+	//beta[1] = 1.0f/3.0f;
+	//beta[2] = 7.0f/12.0f;
 
 	// Intializes random number generator
 	srand((unsigned)time(&t));
 
-	lenia_pixels = randomPixels();
+	lenia_pixels = randomPixelsCenter();
 	pixels2 = zeroPixels();
 
 	init_kernel();
@@ -380,53 +365,23 @@ void initCPU()
 __host__ float potential_distribution(int x, int y, int width, int height) {
 	float sum = 0.0f;
 
-	int close = R; // Rayon de la convolution
-	int kernel_size = 2 * close + 1;
-
-	/*for (int i = -close; i <= close; i++) {
-		for (int j = -close; j <= close; j++) {
-			int current_x = x + i;
-			int current_y = y + j;
-
-			if (is_in_neighborhood(x, y, current_x, current_y, width, height)) {
-				// calculate the wrapped index
-				int wrappedI = (current_x + height) % height;
-				int wrappedJ = (current_y + width) % width;
-
-				// Kernel index (shifted to the center)
-				int kernelI = i + close;
-				int kernelJ = j + close;
-
-				float k_u = n_kernel[kernelI * kernel_size + kernelJ];
-				float f_xPu = lenia_pixels[wrappedI * width + wrappedJ].y;
-
-				sum += k_u * f_xPu;
-			}
-		}
-	}*/
-
-	int center_x = width_grid / 2;
-	int center_y = height_grid / 2;
-
-	for (int i = 0; i < height_grid; i++)
+	for (int i = -R; i <= R; i++)
 	{
-		for (int j = 0; j < width_grid; j++)
+		for (int j = -R; j <= R; j++)
 		{
-			float r = toric_distance(center_x, center_y, i, j, width_grid, height_grid) / R;
-			// if n(i;j) is in the neighborhood:
-			if (toric_distance(center_x, center_y, i, j, width_grid, height_grid) <= R)
-			{
-				int wrappedNI = (x+i + height) % height ;
-				int wrappedNJ = (y+j + width) % width;
-				sum += n_kernel[i * width_grid + j] * lenia_pixels[wrappedNI * width_grid + wrappedNJ].y;
+
+			int ni = (x + i + height) % height;
+			int nj = (y + j + width) % width;
+			float r = sqrt(i * i + j * j) / R;
+			if (r <= 1.0f) {  // within the radius
+				sum += kernel_shell(r) * lenia_pixels[ni * width + nj].y;
 			}
+
 		}
 	}
 
 	return sum / k_s_norm;
 }
-
-
 
 
 
