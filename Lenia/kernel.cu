@@ -23,8 +23,8 @@
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
-#define SCREEN_X 512
-#define SCREEN_Y 512
+#define SCREEN_X 256
+#define SCREEN_Y 256
 #define FPS_UPDATE 500
 #define TITLE "Lenia"
 
@@ -32,8 +32,8 @@
 #define GPU_MODE 2
 #define OPENGL_GPU_MODE 3
 
-int width_grid = 256;
-int height_grid = 256;
+int width_grid = 128;
+int height_grid = 128;
 
 int block_dim_x = 16;
 int block_dim_y = 16;
@@ -42,6 +42,7 @@ int grid_dim_y = (height_grid + block_dim_y - 1) / block_dim_y;
 
 float4* d_grid1, * d_grid2;
 bool tab_1_used = true;
+bool show_kernel = false;
 
 GLuint imageTex;
 GLuint imageBuffer;
@@ -69,14 +70,17 @@ unsigned long long seed = time(NULL); // or any other unique seed value
 
 // Lenia parameters
 
-#define R 10
+#define R 26
 #define T 10
 #define mu 0.15f
-#define sigma 0.014f
+#define sigma 0.017f
 #define alpha 4
 #define B 1 // rank for the pics
 
 float4* lenia_pixels;
+float* n_kernel;
+float k_s_norm;
+float beta[B];
 
 #define checkCudaErrors(err) __checkCudaErrors(err, __FILE__, __LINE__)
 
@@ -110,12 +114,12 @@ float4* randomPixels() {
 		float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
 		float test_alive = (float)rand() / RAND_MAX;
 
-		if (test_alive < 0.77f) {
+		/*if (test_alive < 0.5f) {
 			random_value = 0.0f;
-		}
+		}*/
 
 		p[i].x = 0.0f;
-		p[i].y = random_value; 
+		p[i].y = random_value;
 		p[i].z = 0.0f;
 		p[i].w = 1.0f;
 	}
@@ -124,7 +128,7 @@ float4* randomPixels() {
 
 float4* randomPixelsCenter() {
 	float4* p = (float4*)malloc(size);
-	for (int i = 3 * height_grid/8; i < 5*height_grid/8; i++) {
+	for (int i = 3 * height_grid / 8; i < 5 * height_grid / 8; i++) {
 		for (int j = 3 * width_grid / 8; j < 5 * width_grid / 8; j++) {
 			int index = i * width_grid + j;
 
@@ -135,13 +139,13 @@ float4* randomPixelsCenter() {
 			p[index].z = 0.0f;
 			p[index].w = 1.0f;
 		}
-		
+
 	}
 	return p;
 }
 
 float4* orbium() // pas complet du tout
-{	
+{
 	float4* p = zeroPixels();
 	p[6].y = 0.1f;
 	p[7].y = 0.14f;
@@ -163,22 +167,12 @@ float4* glider()
 	return p;
 }
 
-void initCPU()
-{
-	time_t t;
-
-	// Intializes random number generator
-	srand((unsigned)time(&t));
-
-	lenia_pixels = randomPixels();
-	pixels2 = zeroPixels();
-
-}
 
 void cleanCPU()
 {
 	free(lenia_pixels);
 	free(pixels2);
+	free(n_kernel);
 }
 
 
@@ -209,11 +203,13 @@ void cleanGPU()
 /*
 	exponential core function
 	pre-condition : r between 0 and 1
-	post-condition : return value between O and 1
+	post-condition : return value between 0 and 1
 */
 __host__ __device__ float kernel_core_exp(float r)
 {
-	return exp(alpha - (alpha / (4 * r * (1 - r))));
+	float k = (4.0f * r * (1.0f - r));
+	float k_core = exp(alpha * (1.0f - 1.0f/k));
+	return k_core;
 }
 
 __host__ __device__ float growth_function_exp(float u)
@@ -250,73 +246,187 @@ float growth_function_step(float u) {
 	return d;
 }
 
+int emod(int a, int b)
+{
+	int res = a;
+	if (a < 0)
+	{
+		res = b + a;
+	}
+	else if (a > b)
+	{
+		res = a - b;
+	}
+	return res;
+}
+
+double toric_distance(int x1, int y1, int x2, int y2, int width, int height) {
+	int dx = abs(x1 - x2);
+	int dy = abs(y1 - y2);
+
+	if (dx > width / 2) {
+		dx = width - dx;
+	}
+	if (dy > height / 2) {
+		dy = height - dy;
+	}
+
+	return sqrt(dx * dx + dy * dy);
+}
+
+bool is_in_neighborhood(int x, int y, int i, int j, int width, int height) { // OK
+	double distance = toric_distance(x, y, i, j, width, height);
+	bool val = distance <= R;
+	return val;
+}
+
+
 /*
 	kernel shell
 	pre-conditions : r between 0 and 1 ; beta in [0;1] dim B
 	post-condition : return value between 0 and 1
 */
-/*float kernel_shell(float r, float beta[B])
+float kernel_shell(float n) //OK
 {
-	int index = static_cast<int>(B * r);
-	double fraction = B * r - index;
+	int index = emod(floor((float)B * n), B);
 
 	double peak_height = beta[index];
 
-	return peak_height * kernel_core_exp(fraction);
-}*/
+	float u = fmod(float(B * n), 1.0f);
+
+	return peak_height * kernel_core_exp(u);
+}
+
 
 /*
 	Normalization of the kernel
 	pre-condition : n in the neighbourhood, at the indexes i and j
-	post-condition : 
+	post-condition :
 */
-__host__ __device__ float normalized_kernel(int x, int y, float beta[B], int width_grid, int height_grid)
+__host__ float normalized_kernel(int x, int y, int width_grid, int height_grid)
 {
-	float norm_n = sqrt(x*x + y*y);
-	float Ks_val = kernel_core_exp(norm_n); //kernel_shell(norm_n, beta)
+	int center_x = width_grid / 2;
+	int center_y = height_grid / 2;
 
-	float sum = 0.0f;
-	// sum of the Ks of the neighbourhood (ie where norm(x) <= R)
-	for (int i = x-R; i <= x+R;i++) {
-		for (int j = y-R; j <= y+R;j++) {
-			if (i != x || j != y) {
-				int wrappedI = (i + height_grid) % height_grid;
-				int wrappedJ = (j + width_grid) % width_grid;
-				sum += kernel_core_exp(sqrt(wrappedI * wrappedI + wrappedJ * wrappedJ));//kernel_shell(sqrt(wrappedI * wrappedI + wrappedJ * wrappedJ), beta);
+	float norm_n = toric_distance(center_x, center_y, x, y, width_grid, height_grid) / R;
+	float Ks_val = 0.0f;
+	if (toric_distance(center_x, center_y, x, y, width_grid, height_grid) <= R) {
+		Ks_val = kernel_shell(norm_n);
+	}
+
+	return Ks_val;
+}
+
+
+void init_kernel() {
+
+	n_kernel = (float*)malloc(width_grid * height_grid * sizeof(float));
+
+	for (int x = 0; x < height_grid; x++) {
+		for (int y = 0; y < width_grid; y++) {
+			float val = normalized_kernel(x, y, width_grid, height_grid);
+			n_kernel[x * width_grid + y] = val;
+		}
+	}
+}
+
+float init_k_s_norm()
+{
+	float acc = 0;
+	int center_x = width_grid / 2;
+	int center_y = height_grid / 2;
+
+	for (int i = 0; i < height_grid; i++)
+	{
+		for (int j = 0; j < width_grid; j++)
+		{
+			float r = toric_distance(center_x, center_y, i, j, width_grid, height_grid) / R;
+			if (toric_distance(center_x, center_y, i, j, width_grid, height_grid) <= R)
+			{
+				acc += kernel_shell(r);
 			}
 		}
 	}
-
-	return Ks_val / sum;
+	return acc;
 }
+
+
+void initCPU()
+{
+	time_t t;
+	beta[0] = 1.0f;
+	//beta[1] = 1.0f;
+	//beta[2] = 1.0f;
+
+	// Intializes random number generator
+	srand((unsigned)time(&t));
+
+	lenia_pixels = randomPixels();
+	pixels2 = zeroPixels();
+
+	init_kernel();
+
+	k_s_norm = init_k_s_norm();
+
+	printf("ksnorm = %f\n", k_s_norm);
+}
+
 
 /*
 	Potential distribution U_t(x) - Local rule
 	Pre-condition : in the grid at indexes x and y
 	Post-condition : return value between 0 and 1
 */
-__host__ float potential_distribution(int x, int y, int width, int height)
-{
+__host__ float potential_distribution(int x, int y, int width, int height) {
 	float sum = 0.0f;
-	float beta[B];
-	beta[0] = 1.0f;
 
-	float n_kernel = normalized_kernel(x, y, beta, width, height);
+	int close = R; // Rayon de la convolution
+	int kernel_size = 2 * close + 1;
 
-	for (int i = x - R; i <= x + R;i++) {
-		for (int j = y - R; j <= y + R;j++) {
-			if (i != x || j != y) {
+	/*for (int i = -close; i <= close; i++) {
+		for (int j = -close; j <= close; j++) {
+			int current_x = x + i;
+			int current_y = y + j;
+
+			if (is_in_neighborhood(x, y, current_x, current_y, width, height)) {
 				// calculate the wrapped index
-				int wrappedI = (i + height_grid) % height_grid;
-				int wrappedJ = (j + width_grid) % width_grid;
+				int wrappedI = (current_x + height) % height;
+				int wrappedJ = (current_y + width) % width;
 
-				sum += n_kernel * lenia_pixels[wrappedI * width_grid + wrappedJ].y;
+				// Kernel index (shifted to the center)
+				int kernelI = i + close;
+				int kernelJ = j + close;
+
+				float k_u = n_kernel[kernelI * kernel_size + kernelJ];
+				float f_xPu = lenia_pixels[wrappedI * width + wrappedJ].y;
+
+				sum += k_u * f_xPu;
+			}
+		}
+	}*/
+
+	int center_x = width_grid / 2;
+	int center_y = height_grid / 2;
+
+	for (int i = 0; i < height_grid; i++)
+	{
+		for (int j = 0; j < width_grid; j++)
+		{
+			float r = toric_distance(center_x, center_y, i, j, width_grid, height_grid) / R;
+			// if n(i;j) is in the neighborhood:
+			if (toric_distance(center_x, center_y, i, j, width_grid, height_grid) <= R)
+			{
+				int wrappedNI = (x+i + height) % height ;
+				int wrappedNJ = (y+j + width) % width;
+				sum += n_kernel[i * width_grid + j] * lenia_pixels[wrappedNI * width_grid + wrappedNJ].y;
 			}
 		}
 	}
 
-	return sum;
+	return sum / k_s_norm;
 }
+
+
 
 
 
@@ -352,7 +462,7 @@ void lenia_basic_CPU()
 }
 
 
-__global__ void lenia (float4* d_grid_old, float4* d_grid_new, int width, int height)
+/*__global__ void lenia(float4* d_grid_old, float4* d_grid_new, int width, int height)
 {
 	int indexX = threadIdx.x + blockIdx.x * blockDim.x;
 	int indexY = threadIdx.y + blockIdx.y * blockDim.y;
@@ -440,7 +550,7 @@ void lenia_basic_GPU()
 		checkCudaErrors(cudaMemcpy(lenia_pixels, d_grid1, size, cudaMemcpyDeviceToHost));
 	}
 
-}
+}*/
 
 
 void calculate() {
@@ -454,7 +564,7 @@ void calculate() {
 		{
 		case CPU_MODE: m = "CPU mode"; break;
 		case GPU_MODE: m = "GPU mode"; break;
-		//case OPENGL_GPU_MODE: m = "GPU mode - OpenGL interoperability"; break;
+			//case OPENGL_GPU_MODE: m = "GPU mode - OpenGL interoperability"; break;
 		}
 		sprintf(t, "%s:  %s, %.2f FPS", TITLE, m, frame * 1000 / (float)(timecur - timebase));
 		glutSetWindowTitle(t);
@@ -468,10 +578,10 @@ void calculate() {
 		lenia_basic_CPU();
 		lenia_pixels = pixels2;
 		break;
-	case GPU_MODE: 
-		lenia_basic_GPU(); 
+	case GPU_MODE:
+		//lenia_basic_GPU();
 		break;
-	//case OPENGL_GPU_MODE: bugsCPU(); break;
+		//case OPENGL_GPU_MODE: bugsCPU(); break;
 	}
 }
 
@@ -498,7 +608,6 @@ void draw_pixels_zoomed()
 			else {
 				color = lenia_pixels[i * width_grid + j];
 			}
-			
 
 			// Draw a rectangle representing the grid cell
 			glBegin(GL_QUADS);
@@ -512,16 +621,46 @@ void draw_pixels_zoomed()
 	}
 }
 
+void draw_kernel()
+{
+	// Calculate the size of each grid cell on the screen
+	int cell_size_x = SCREEN_X / width_grid;
+	int cell_size_y = SCREEN_Y / height_grid;
+
+	for (int i = 0; i < height_grid; i++)
+	{
+		for (int j = 0; j < width_grid; j++)
+		{
+			float color_val = n_kernel[i * width_grid + j];
+			//printf("%f;", n_kernel[i * width_grid + j]);
+			// Draw a rectangle representing the grid cell
+			glBegin(GL_QUADS);
+			glColor4f(color_val, color_val, color_val, 1.0f);
+			glVertex2i(j * cell_size_x, i * cell_size_y); // Top-left corner
+			glVertex2i((j + 1) * cell_size_x, i * cell_size_y); // Top-right corner
+			glVertex2i((j + 1) * cell_size_x, (i + 1) * cell_size_y); // Bottom-right corner
+			glVertex2i(j * cell_size_x, (i + 1) * cell_size_y); // Bottom-left corner
+			glEnd();
+		}
+	}
+	//printf("\n");
+}
+
 
 void render()
 {
 	calculate();
 
-	if (SCREEN_X == width_grid && SCREEN_Y == height_grid) {
-		glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, lenia_pixels);
+	if (show_kernel) {
+		draw_kernel();
 	}
 	else {
-		draw_pixels_zoomed();
+		if (SCREEN_X == width_grid && SCREEN_Y == height_grid) {
+			glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, lenia_pixels);
+		}
+		else {
+			draw_pixels_zoomed();
+		}
 	}
 
 	tab_1_used = !tab_1_used;
@@ -583,6 +722,7 @@ void processNormalKeys(unsigned char key, int x, int y) {
 	else if (key == '1') toggleMode(CPU_MODE);
 	else if (key == '2') toggleMode(GPU_MODE);
 	//else if (key == '3') toggleMode(OPENGL_GPU_MODE);
+	else if (key == 'k') show_kernel = !show_kernel;
 }
 
 void processSpecialKeys(int key, int x, int y) {
