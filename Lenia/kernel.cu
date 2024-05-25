@@ -352,8 +352,6 @@ void initCPU()
 	init_kernel();
 
 	k_s_norm = init_k_s_norm();
-
-	printf("ksnorm = %f\n", k_s_norm);
 }
 
 
@@ -566,7 +564,7 @@ void draw_pixels_zoomed()
 
 			// Draw a rectangle representing the grid cell
 			glBegin(GL_QUADS);
-			glColor4f(color.y, color.y, color.y, color.w);
+			glColor4f(color.x, color.y, color.z, color.w);
 			glVertex2i(j * cell_size_x, i * cell_size_y); // Top-left corner
 			glVertex2i((j + 1) * cell_size_x, i * cell_size_y); // Top-right corner
 			glVertex2i((j + 1) * cell_size_x, (i + 1) * cell_size_y); // Bottom-right corner
@@ -587,10 +585,9 @@ void draw_kernel()
 		for (int j = 0; j < width_grid; j++)
 		{
 			float color_val = n_kernel[i * width_grid + j];
-			//printf("%f;", n_kernel[i * width_grid + j]);
 			// Draw a rectangle representing the grid cell
 			glBegin(GL_QUADS);
-			glColor4f(color_val, color_val, color_val, 1.0f);
+			glColor4f(0.0f, 0.0f, color_val, 1.0f);
 			glVertex2i(j * cell_size_x, i * cell_size_y); // Top-left corner
 			glVertex2i((j + 1) * cell_size_x, i * cell_size_y); // Top-right corner
 			glVertex2i((j + 1) * cell_size_x, (i + 1) * cell_size_y); // Bottom-right corner
@@ -598,7 +595,6 @@ void draw_kernel()
 			glEnd();
 		}
 	}
-	//printf("\n");
 }
 
 
