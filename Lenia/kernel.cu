@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
+
 #define GRIDSIZE 128
 
 #define SCREEN_X GRIDSIZE
@@ -71,6 +72,21 @@ int timebase = 0;
 #define alpha 4
 #define B 1 // rank for the pics
 
+// Kernel struct
+struct Noyau {
+    int id;
+    int range;
+    int source_channel;
+    int dest_channel;
+    float h;
+    float beta[B];
+    float k_s_norm;
+    float* n_kernel;
+};
+
+Noyau* kernel; // basic version
+Noyau* kernels[3]; // expanded version
+
 float4* lenia_pixels;
 float4* lenia_pixels2;
 int size;
@@ -79,6 +95,7 @@ float* n_kernel;
 float k_s_norm;
 float beta[B];
 __constant__ float cm_beta[B];
+
 
 #define checkCudaErrors(err) __checkCudaErrors(err, __FILE__, __LINE__)
 
@@ -152,7 +169,7 @@ float4* randomPixels() {
     return p;
 }
 
-float4* randomPixelsCenter() {
+float4* randomPixelsCenter(int nbChannels) {
     float4* p = (float4*)malloc(size);
     for (int i = 3 * height_grid / 8; i < 5 * height_grid / 8; i++) {
         for (int j = 3 * width_grid / 8; j < 5 * width_grid / 8; j++) {
@@ -160,9 +177,11 @@ float4* randomPixelsCenter() {
 
             if (index % (10 * width_grid) == 0) srand(index);
             float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
-            p[index].x = 0.0f;
+            float random_value2 = (float)rand() / RAND_MAX;
+            float random_value3 = (float)rand() / RAND_MAX;
+            p[index].x = (nbChannels > 1) ? random_value3 : 0.0f;
             p[index].y = random_value;
-            p[index].z = 0.0f;
+            p[index].z = (nbChannels == 3) ? random_value2 : 0.0f;
             p[index].w = 1.0f;
         }
 
@@ -181,28 +200,43 @@ float4* glider()
     return p;
 }
 
+// Free Noyau resources
+void freeNoyau(Noyau* n) {
+    free(n->n_kernel);
+    free(n);
+}
+
 
 void cleanCPU()
 {
     free(lenia_pixels);
     free(lenia_pixels2);
-    free(n_kernel);
+    freeNoyau(kernel);
 }
 
+void cleanExtendedCPU()
+{
+    free(lenia_pixels);
+    free(lenia_pixels2);
+
+    for (Noyau* k : kernels) {
+        freeNoyau(k);
+    }
+}
 
 void cleanGPU()
 {
     free(lenia_pixels);
+    freeNoyau(kernel);
+
     cudaGraphicsUnregisterResource(cuBuffer);
     glDeleteTextures(1, &glTex);
     glDeleteBuffers(1, &glBuffer);
 
-    free(n_kernel);
     cudaFree(d_grid1);
     cudaFree(d_grid2);
 }
 
-// ------------------------- LENIA -------------------------------------------------------------------------------------
 
 /*
     exponential core function
@@ -310,56 +344,82 @@ __host__ float normalized_kernel(int x, int y, float beta[])
     return Ks_val;
 }
 
-
-__host__ void init_kernel() {
-
-    n_kernel = (float*)malloc(width_grid * height_grid * sizeof(float));
-
-    for (int x = 0; x < height_grid; x++) {
-        for (int y = 0; y < width_grid; y++) {
-            float val = normalized_kernel(x, y, beta);
-            n_kernel[x * width_grid + y] = val;
-        }
-    }
-}
-
-__host__ float init_k_s_norm() {
+void calculateKsNorm(Noyau* k)
+{
     float acc = 0;
-    for (int i = -R; i <= R; i++) {
-        for (int j = -R; j <= R; j++) {
-            float r = sqrt(i * i + j * j) / R;
+    for (int i = -k->range; i <= k->range; i++) {
+        for (int j = -k->range; j <= k->range; j++) {
+            float r = (float)sqrt(i * i + j * j) / (float)k->range;
             if (r <= 1.0f) {  // within the radius
                 acc += kernel_shell(r, beta);
             }
         }
     }
-    return acc;
+    k->k_s_norm = acc;
 }
 
+void init_kernel(Noyau* k) {
+
+    k->n_kernel = (float*)malloc(width_grid * height_grid * sizeof(float));
+
+    for (int x = 0; x < height_grid; x++) {
+        for (int y = 0; y < width_grid; y++) {
+            float val = normalized_kernel(x, y, beta);
+            k->n_kernel[x * width_grid + y] = val;
+        }
+    }
+}
+
+// Initialize Noyau
+void initNoyau(Noyau* n, int id, int r, int src, int dest, float h) {
+    n->id = id;
+    n->range = r;
+    n->source_channel = src;
+    n->dest_channel = dest;
+    n->h = h;
+    n->beta[0] = 1.0f;
+
+    calculateKsNorm(n);
+    init_kernel(n);
+}
 
 void initCPU()
 {
     tab_1_used = true;
 
-    time_t t;
     beta[0] = 1.0f;
     //beta[1] = 1.0f/3.0f;
     //beta[2] = 7.0f/12.0f;
 
-    lenia_pixels = randomPixelsCenter();
+    lenia_pixels = randomPixelsCenter(1);
     lenia_pixels2 = zeroPixels();
 
-    init_kernel();
+    kernel = (Noyau*)malloc(sizeof(Noyau));
+    initNoyau(kernel, 0, R, 0, 0, 1);
 
-    k_s_norm = init_k_s_norm();
+    k_s_norm = kernel->k_s_norm;
 }
 
+void initExpandedCPU()
+{
+    tab_1_used = true;
+
+    beta[0] = 1.0f;
+    //beta[1] = 1.0f/3.0f;
+    //beta[2] = 7.0f/12.0f;
+
+    lenia_pixels = randomPixelsCenter(3);
+    lenia_pixels2 = zeroPixels();
+
+    Noyau* k0 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k0, 0, R, 0, 1, 1); kernels[0] = k0;
+    Noyau* k1 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k1, 1, R, 1, 2, 1); kernels[1] = k1;
+    Noyau* k2 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k2, 2, R, 2, 0, 1); kernels[2] = k2;
+}
 
 void initGPU()
 {
     tab_1_used = true;
 
-    time_t t;
     beta[0] = 1.0f;
     //beta[1] = 1.0f/3.0f;
     //beta[2] = 7.0f/12.0f;
@@ -370,12 +430,13 @@ void initGPU()
     checkCudaErrors(cudaMalloc((void**)&d_grid1, size));
     checkCudaErrors(cudaMalloc((void**)&d_grid2, size));
 
-    lenia_pixels = randomPixelsCenter();
+    lenia_pixels = randomPixelsCenter(1);
     checkCudaErrors(cudaMemcpy(d_grid1, lenia_pixels, size, cudaMemcpyHostToDevice));
 
-    init_kernel();
+    kernel = (Noyau*)malloc(sizeof(Noyau));
+    initNoyau(kernel, 0, R, 0, 0, 1);
 
-    k_s_norm = init_k_s_norm();
+    k_s_norm = kernel -> k_s_norm;
 }
 
 
@@ -404,7 +465,7 @@ __host__ __device__ float potential_distribution(int x, int y, float4 d_grid_old
     return sum / k_s_norm;
 }
 
-__host__ __device__ void computeLenia(int i, int j, float4* p1, float4* p2, float k_s_norm, float* beta) {
+__host__ __device__ void computeBasicLenia(int i, int j, float4* p1, float4* p2, float k_s_norm, float* beta) {
     int index = i * width_grid + j;
     float c_t = p1[index].y; // field C at time step t
     float c_tdt; // field C at time step t + delta(t) ; (delta (t) = 1/T)
@@ -432,7 +493,7 @@ __host__ void lenia_basic_CPU(float4* p1, float4* p2)
     // for each pixel
     for (int i = 0; i < height_grid; i++) {
         for (int j = 0; j < width_grid; j++) {
-            computeLenia(i, j, p1, p2, k_s_norm, beta);
+            computeBasicLenia(i, j, p1, p2, k_s_norm, beta);
         }
     }
 }
@@ -445,7 +506,7 @@ __global__ void lenia_gpu(float4* p1, float4* p2, float4* cuPixels, float k_s_no
     int index = i * width_grid + j;
 
     if (i < height_grid && j < width_grid) {
-        computeLenia(i, j, p1, p2, k_s_norm, cm_beta);
+        computeBasicLenia(i, j, p1, p2, k_s_norm, cm_beta);
         cuPixels[index] = p2[index];
     }
 }
@@ -466,10 +527,10 @@ void lenia_basic_GPU()
 
     // do treatments
     if (tab_1_used) {
-        lenia_gpu << <dimGrid, dimBlock >> > (d_grid1, d_grid2, cuPixels, k_s_norm);
+        lenia_gpu <<< dimGrid, dimBlock >>> (d_grid1, d_grid2, cuPixels, k_s_norm);
     }
     else {
-        lenia_gpu << <dimGrid, dimBlock >> > (d_grid2, d_grid1, cuPixels, k_s_norm);
+        lenia_gpu <<< dimGrid, dimBlock >>> (d_grid2, d_grid1, cuPixels, k_s_norm);
     }
 
     cudaGraphicsUnmapResources(1, &cuBuffer);
@@ -481,6 +542,52 @@ void lenia_basic_GPU()
     }
 }
 
+__host__ void computeExpandedLenia(int i, int j, float4* p1, float4* p2, float k_s_norm, float* beta) {
+    int index = i * width_grid + j;
+    float c_tdt_x, c_tdt_y, c_tdt_z ; // field C at time step t + delta(t) ; (delta (t) = 1/T)
+
+    float h_tot = kernels[0]->h + kernels[1]->h + kernels[2]->h;
+
+    // for each kernel K(k) : 
+    for (Noyau* k : kernels)
+    {
+        // 1st step : convolution operation, multiplication with the kernel k with source A
+        float u_t = potential_distribution_ext(k->id, i, j, p1, width_grid, height_grid); // TO-DO
+        // 2nd step : growth mapping
+        float g_t = growth_function_exp(u_t);
+        // 3rd step : add the growth to the existing value of the dest channel
+        float dt = 1.0f / float(T);
+        float weighted_sum = (k->h / h_tot);
+
+        switch (k->dest_channel)
+        {
+        case 0:
+            c_tdt_x = p1[index].x + dt * weighted_sum * g_t;
+            break;
+        case 1:
+            c_tdt_y = p1[index].y + dt * weighted_sum * g_t;
+            break;
+        default:
+            c_tdt_z = p1[index].z + dt * weighted_sum * g_t;
+            break;
+        }
+    }
+
+        
+    // 4th step : clip the result to be in range from 0 to 1
+    if (c_tdt_x < 0.0f) c_tdt_x = 0.0f;
+    if (c_tdt_x > 1.0f) c_tdt_x = 1.0f;
+    if (c_tdt_y < 0.0f) c_tdt_y = 0.0f;
+    if (c_tdt_y > 1.0f) c_tdt_y = 1.0f;
+    if (c_tdt_z < 0.0f) c_tdt_z = 0.0f;
+    if (c_tdt_z > 1.0f) c_tdt_z = 1.0f;
+
+    // assign the value
+    p2[index].x = c_tdt_x;
+    p2[index].y = c_tdt_y;
+    p2[index].z = c_tdt_z;
+    p2[index].w = 1.0f;
+}
 
 
 void calculate() {
@@ -559,7 +666,7 @@ void draw_kernel()
     {
         for (int j = 0; j < width_grid; j++)
         {
-            float color_val = n_kernel[i * width_grid + j];
+            float color_val = kernel->n_kernel[i * width_grid + j];
             // Draw a rectangle representing the grid cell
             glBegin(GL_QUADS);
             glColor4f(0.0f, 0.0f, color_val, 1.0f);
