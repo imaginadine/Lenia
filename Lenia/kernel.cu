@@ -24,7 +24,7 @@
 #include <cuda_gl_interop.h>
 
 
-#define GRIDSIZE 128
+#define GRIDSIZE 256
 
 #define SCREEN_X GRIDSIZE
 #define SCREEN_Y GRIDSIZE
@@ -33,6 +33,7 @@
 
 #define CPU_MODE 1
 #define GPU_MODE 2
+#define CPU_EXT_MODE 3
 
 #define width_grid GRIDSIZE
 #define height_grid GRIDSIZE
@@ -400,7 +401,7 @@ void initCPU()
     k_s_norm = kernel->k_s_norm;
 }
 
-void initExpandedCPU()
+void initExtendedCPU()
 {
     tab_1_used = true;
 
@@ -456,7 +457,6 @@ __host__ __device__ float potential_distribution(int x, int y, float4 d_grid_old
             int nj = (y + j + width) % width;
             float r = sqrtf(i * i + j * j) / R;
             if (r <= 1.0f) {  // within the radius
-                //float grid_value = d_grid_old[ni * width + nj].y;
                 sum += kernel_shell(r, beta) * d_grid_old[ni * width + nj].y;
             }
         }
@@ -542,7 +542,52 @@ void lenia_basic_GPU()
     }
 }
 
-__host__ void computeExpandedLenia(int i, int j, float4* p1, float4* p2, float k_s_norm, float* beta) {
+
+
+// ----------------------- EXPANDED VERSION ----------------------------------------------------------
+
+
+/*
+    Potential distribution U_t(x) - Local rule
+    Pre-condition : in the grid at indexes x and y
+    Post-condition : return value between 0 and 1
+*/
+__host__ float potential_distribution_ext(Noyau* k, int x, int y, float4 d_grid_old[], int width, int height) {
+
+    float sum = 0.0f;
+    for (int i = -R; i <= R; i++)
+    {
+        for (int j = -R; j <= R; j++)
+        {
+            int ni = (x + i + height) % height;
+            int nj = (y + j + width) % width;
+            float r = sqrtf(i * i + j * j) / R;
+            if (r <= 1.0f) {  // within the radius
+                float grid_value;
+                switch (k->source_channel)
+                {
+                case 0:
+                    grid_value = d_grid_old[ni * width + nj].x;
+                    break;
+                case 1:
+                    grid_value = d_grid_old[ni * width + nj].y;
+                    break;
+                default:
+                    grid_value = d_grid_old[ni * width + nj].z;
+                    break;
+                }
+                sum += kernel_shell(r, beta) * grid_value; // suite -> kernell shell en fct du beta du noyau
+            }
+        }
+    }
+
+    return sum / k->k_s_norm;
+}
+
+
+__host__ void computeExtendedLenia(int i, int j, float4* p1, float4* p2) {
+
+    
     int index = i * width_grid + j;
     float c_tdt_x, c_tdt_y, c_tdt_z ; // field C at time step t + delta(t) ; (delta (t) = 1/T)
 
@@ -552,7 +597,7 @@ __host__ void computeExpandedLenia(int i, int j, float4* p1, float4* p2, float k
     for (Noyau* k : kernels)
     {
         // 1st step : convolution operation, multiplication with the kernel k with source A
-        float u_t = potential_distribution_ext(k->id, i, j, p1, width_grid, height_grid); // TO-DO
+        float u_t = potential_distribution_ext(k, i, j, p1, width_grid, height_grid);
         // 2nd step : growth mapping
         float g_t = growth_function_exp(u_t);
         // 3rd step : add the growth to the existing value of the dest channel
@@ -589,6 +634,16 @@ __host__ void computeExpandedLenia(int i, int j, float4* p1, float4* p2, float k
     p2[index].w = 1.0f;
 }
 
+__host__ void lenia_extended_CPU(float4* p1, float4* p2)
+{
+    // for each pixel
+    for (int i = 0; i < height_grid; i++) {
+        for (int j = 0; j < width_grid; j++) {
+            computeExtendedLenia(i, j, p1, p2);
+        }
+    }
+}
+
 
 void calculate() {
     frame++;
@@ -601,6 +656,7 @@ void calculate() {
         {
         case CPU_MODE: m = "CPU mode"; break;
         case GPU_MODE: m = "GPU mode"; break;
+        case CPU_EXT_MODE: m = "CPU extended mode"; break;
         }
         sprintf(t, "%s:  %s, %.2f FPS", TITLE, m, frame * 1000 / (float)(timecur - timebase));
         glutSetWindowTitle(t);
@@ -613,6 +669,10 @@ void calculate() {
     case CPU_MODE:
         if (tab_1_used) lenia_basic_CPU(lenia_pixels, lenia_pixels2);
         else  lenia_basic_CPU(lenia_pixels2, lenia_pixels);
+        break;
+    case CPU_EXT_MODE:
+        if (tab_1_used) lenia_extended_CPU(lenia_pixels, lenia_pixels2);
+        else  lenia_extended_CPU(lenia_pixels2, lenia_pixels);
         break;
     case GPU_MODE:
         lenia_basic_GPU();
@@ -689,7 +749,7 @@ void render()
     }
     else {
         // mode CPU
-        if (mode == CPU_MODE) {
+        if (mode == CPU_MODE || mode == CPU_EXT_MODE) {
             if (SCREEN_X == width_grid && SCREEN_Y == height_grid) {
                 glDrawPixels(SCREEN_X, SCREEN_Y, GL_RGBA, GL_FLOAT, tab_1_used ? lenia_pixels2 : lenia_pixels);
             }
@@ -731,6 +791,7 @@ void clean()
     {
     case CPU_MODE: cleanCPU(); break;
     case GPU_MODE: cleanGPU(); break;
+    case CPU_EXT_MODE: cleanExtendedCPU(); break;
     }
 
 }
@@ -752,6 +813,7 @@ void init()
     {
     case CPU_MODE: initCPU(); break;
     case GPU_MODE: initGPU(); break;
+    case CPU_EXT_MODE: initExtendedCPU(); break;
     }
 }
 
@@ -785,6 +847,7 @@ void processNormalKeys(unsigned char key, int x, int y) {
     if (key == 27) { clean(); exit(0); }
     else if (key == '1') toggleMode(CPU_MODE);
     else if (key == '2') toggleMode(GPU_MODE);
+    else if (key == '3') toggleMode(CPU_EXT_MODE);
     else if (key == 'k') show_kernel = !show_kernel;
 }
 
