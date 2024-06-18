@@ -66,12 +66,12 @@ int timebase = 0;
 
 // Lenia parameters
 
-#define R 13
+#define R 12
 #define T 10
 #define mu 0.15f
 #define sigma 0.017f
 #define alpha 4
-#define B 1 // rank for the pics
+#define B 3 // rank for the pics
 
 // Kernel struct
 struct Noyau {
@@ -151,20 +151,24 @@ float4* zeroPixels() {
     return p;
 }
 
-float4* randomPixels() {
+float4* randomPixels(int nbChannels) {
     float4* p = (float4*)malloc(size);
     for (int i = 0; i < width_grid * height_grid; i++) {
         if (i % (10 * width_grid) == 0) srand(i);
         float random_value = (float)rand() / RAND_MAX; // Generate a random float between 0 and 1
+        float random_value2 = (float)rand() / RAND_MAX;
+        float random_value3 = (float)rand() / RAND_MAX;
         float test_alive = (float)rand() / RAND_MAX;
 
         if (test_alive < 0.77f) {
             random_value = 0.0f;
+            random_value2 = 0.0f;
+            random_value3 = 0.0f;
         }
 
-        p[i].x = 0.0f;
+        p[i].x = (nbChannels > 1) ? random_value3 : 0.0f;
         p[i].y = random_value;
-        p[i].z = 0.0f;
+        p[i].z = (nbChannels == 3) ? random_value2 : 0.0f;
         p[i].w = 1.0f;
     }
     return p;
@@ -207,7 +211,6 @@ void freeNoyau(Noyau* n) {
     free(n);
 }
 
-
 void cleanCPU()
 {
     free(lenia_pixels);
@@ -237,6 +240,7 @@ void cleanGPU()
     cudaFree(d_grid1);
     cudaFree(d_grid2);
 }
+
 
 
 /*
@@ -372,31 +376,39 @@ void init_kernel(Noyau* k) {
 }
 
 // Initialize Noyau
-void initNoyau(Noyau* n, int id, int r, int src, int dest, float h) {
+void initNoyau(Noyau* n, int id, int r, int src, int dest, float h, float b0, float b1, float b2) {
     n->id = id;
     n->range = r;
     n->source_channel = src;
     n->dest_channel = dest;
     n->h = h;
-    n->beta[0] = 1.0f;
+    if (B == 1) {
+        n->beta[0] = b0;
+    }
+    else {
+        n->beta[0] = b0;
+        n->beta[1] = b1;
+        n->beta[2] = b2;
+    }
 
     calculateKsNorm(n);
     init_kernel(n);
 }
+
 
 void initCPU()
 {
     tab_1_used = true;
 
     beta[0] = 1.0f;
-    //beta[1] = 1.0f/3.0f;
-    //beta[2] = 7.0f/12.0f;
+    beta[1] = 1.0f / 3.0f;
+    beta[2] = 7.0f / 12.0f;
 
     lenia_pixels = randomPixelsCenter(1);
     lenia_pixels2 = zeroPixels();
 
     kernel = (Noyau*)malloc(sizeof(Noyau));
-    initNoyau(kernel, 0, R, 0, 0, 1);
+    initNoyau(kernel, 0, R, 0, 0, 1, beta[0], beta[1], beta[2]);
 
     k_s_norm = kernel->k_s_norm;
 }
@@ -405,16 +417,12 @@ void initExtendedCPU()
 {
     tab_1_used = true;
 
-    beta[0] = 1.0f;
-    //beta[1] = 1.0f/3.0f;
-    //beta[2] = 7.0f/12.0f;
-
-    lenia_pixels = randomPixelsCenter(3);
+    lenia_pixels = randomPixels(3);
     lenia_pixels2 = zeroPixels();
 
-    Noyau* k0 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k0, 0, R, 0, 1, 1); kernels[0] = k0;
-    Noyau* k1 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k1, 1, R, 1, 2, 1); kernels[1] = k1;
-    Noyau* k2 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k2, 2, R, 2, 0, 1); kernels[2] = k2;
+    Noyau* k0 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k0, 0, R, 0, 1, 1, 1.0f, 1.0f / 3.0f, 7.0f / 12.0f); kernels[0] = k0;
+    Noyau* k1 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k1, 1, R, 1, 2, 1, 7.0f / 12.0f, 1.0f, 1.0f / 3.0f); kernels[1] = k1;
+    Noyau* k2 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k2, 2, R, 2, 0, 1, 1.0f / 3.0f, 7.0f / 12.0f, 1.0f); kernels[2] = k2;
 }
 
 void initGPU()
@@ -422,8 +430,8 @@ void initGPU()
     tab_1_used = true;
 
     beta[0] = 1.0f;
-    //beta[1] = 1.0f/3.0f;
-    //beta[2] = 7.0f/12.0f;
+    beta[1] = 1.0f / 3.0f;
+    beta[2] = 7.0f / 12.0f;
     cudaMemcpyToSymbol(cm_beta, beta, B * sizeof(float));
 
     initOpenGlCUDA();
@@ -435,9 +443,9 @@ void initGPU()
     checkCudaErrors(cudaMemcpy(d_grid1, lenia_pixels, size, cudaMemcpyHostToDevice));
 
     kernel = (Noyau*)malloc(sizeof(Noyau));
-    initNoyau(kernel, 0, R, 0, 0, 1);
+    initNoyau(kernel, 0, R, 0, 0, 1, beta[0], beta[1], beta[2]);
 
-    k_s_norm = kernel -> k_s_norm;
+    k_s_norm = kernel->k_s_norm;
 }
 
 
@@ -527,10 +535,10 @@ void lenia_basic_GPU()
 
     // do treatments
     if (tab_1_used) {
-        lenia_gpu <<< dimGrid, dimBlock >>> (d_grid1, d_grid2, cuPixels, k_s_norm);
+        lenia_gpu << < dimGrid, dimBlock >> > (d_grid1, d_grid2, cuPixels, k_s_norm);
     }
     else {
-        lenia_gpu <<< dimGrid, dimBlock >>> (d_grid2, d_grid1, cuPixels, k_s_norm);
+        lenia_gpu << < dimGrid, dimBlock >> > (d_grid2, d_grid1, cuPixels, k_s_norm);
     }
 
     cudaGraphicsUnmapResources(1, &cuBuffer);
@@ -576,7 +584,7 @@ __host__ float potential_distribution_ext(Noyau* k, int x, int y, float4 d_grid_
                     grid_value = d_grid_old[ni * width + nj].z;
                     break;
                 }
-                sum += kernel_shell(r, beta) * grid_value; // suite -> kernell shell en fct du beta du noyau
+                sum += kernel_shell(r, k->beta) * grid_value;
             }
         }
     }
@@ -587,9 +595,9 @@ __host__ float potential_distribution_ext(Noyau* k, int x, int y, float4 d_grid_
 
 __host__ void computeExtendedLenia(int i, int j, float4* p1, float4* p2) {
 
-    
+
     int index = i * width_grid + j;
-    float c_tdt_x, c_tdt_y, c_tdt_z ; // field C at time step t + delta(t) ; (delta (t) = 1/T)
+    float c_tdt_x, c_tdt_y, c_tdt_z; // field C at time step t + delta(t) ; (delta (t) = 1/T)
 
     float h_tot = kernels[0]->h + kernels[1]->h + kernels[2]->h;
 
@@ -618,7 +626,7 @@ __host__ void computeExtendedLenia(int i, int j, float4* p1, float4* p2) {
         }
     }
 
-        
+
     // 4th step : clip the result to be in range from 0 to 1
     if (c_tdt_x < 0.0f) c_tdt_x = 0.0f;
     if (c_tdt_x > 1.0f) c_tdt_x = 1.0f;
