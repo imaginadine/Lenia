@@ -34,6 +34,7 @@
 #define CPU_MODE 1
 #define GPU_MODE 2
 #define CPU_EXT_MODE 3
+#define GPU_EXT_MODE 4
 
 #define width_grid GRIDSIZE
 #define height_grid GRIDSIZE
@@ -60,7 +61,7 @@ float* debug;
 float scale = 0.003f;
 float mx = 0.f;
 float my = 0.f;
-int mode = CPU_MODE;
+int mode = GPU_MODE;
 int frame = 0;
 int timebase = 0;
 
@@ -87,6 +88,7 @@ struct Noyau {
 
 Noyau* kernel; // basic version
 Noyau* kernels[3]; // expanded version
+Noyau kernel1; Noyau kernel0; Noyau kernel2;
 
 float4* lenia_pixels;
 float4* lenia_pixels2;
@@ -241,6 +243,20 @@ void cleanGPU()
     cudaFree(d_grid2);
 }
 
+void cleanExtendedGPU()
+{
+    free(lenia_pixels);
+    for (Noyau* k : kernels) {
+        freeNoyau(k);
+    }
+
+    cudaGraphicsUnregisterResource(cuBuffer);
+    glDeleteTextures(1, &glTex);
+    glDeleteBuffers(1, &glBuffer);
+
+    cudaFree(d_grid1);
+    cudaFree(d_grid2);
+}
 
 
 /*
@@ -448,6 +464,23 @@ void initGPU()
     k_s_norm = kernel->k_s_norm;
 }
 
+void initExtendedGPU()
+{
+    tab_1_used = true;
+
+    initOpenGlCUDA();
+
+    checkCudaErrors(cudaMalloc((void**)&d_grid1, size));
+    checkCudaErrors(cudaMalloc((void**)&d_grid2, size));
+
+    lenia_pixels = randomPixels(3);
+    checkCudaErrors(cudaMemcpy(d_grid1, lenia_pixels, size, cudaMemcpyHostToDevice));
+
+    Noyau* k0 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k0, 0, R, 0, 1, 1, 1.0f, 1.0f / 3.0f, 7.0f / 12.0f); kernels[0] = k0; kernel0 = *k0; //???
+    Noyau* k1 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k1, 1, R, 1, 2, 1, 7.0f / 12.0f, 1.0f, 1.0f / 3.0f); kernels[1] = k1; kernel1 = *k1;
+    Noyau* k2 = (Noyau*)malloc(sizeof(Noyau)); initNoyau(k2, 2, R, 2, 0, 1, 1.0f / 3.0f, 7.0f / 12.0f, 1.0f); kernels[2] = k2; kernel2 = *k2;
+}
+
 
 /*
     Potential distribution U_t(x) - Local rule
@@ -555,12 +588,14 @@ void lenia_basic_GPU()
 // ----------------------- EXPANDED VERSION ----------------------------------------------------------
 
 
+
+
 /*
     Potential distribution U_t(x) - Local rule
     Pre-condition : in the grid at indexes x and y
     Post-condition : return value between 0 and 1
 */
-__host__ float potential_distribution_ext(Noyau* k, int x, int y, float4 d_grid_old[], int width, int height) {
+__host__ __device__ float potential_distribution_ext(Noyau* k, int x, int y, float4 d_grid_old[], int width, int height) {
 
     float sum = 0.0f;
     for (int i = -R; i <= R; i++)
@@ -588,7 +623,6 @@ __host__ float potential_distribution_ext(Noyau* k, int x, int y, float4 d_grid_
             }
         }
     }
-
     return sum / k->k_s_norm;
 }
 
@@ -642,6 +676,70 @@ __host__ void computeExtendedLenia(int i, int j, float4* p1, float4* p2) {
     p2[index].w = 1.0f;
 }
 
+__device__ void computeExtendedLeniaGpu(int i, int j, float4* p1, float4* p2, Noyau kernel0, Noyau kernel1, Noyau kernel2) {
+
+
+    int index = i * width_grid + j;
+    float c_tdt_x, c_tdt_y, c_tdt_z; // field C at time step t + delta(t) ; (delta (t) = 1/T)
+
+    float h_tot = kernel0.h + kernel1.h + kernel2.h;
+
+    // for each kernel K(k) : 
+    for (int l=0; l<3 ;l++)
+    {
+        Noyau k;
+        switch (l)
+        {
+        case 0:
+            k = kernel0;
+            break;
+        case 1:
+            k = kernel1;
+            break;
+        default:
+            k = kernel2;
+            break;
+        }
+
+        // 1st step : convolution operation, multiplication with the kernel k with source A
+        float u_t = potential_distribution_ext(&k, i, j, p1, width_grid, height_grid);
+        // 2nd step : growth mapping
+        float g_t = growth_function_exp(u_t);
+        // 3rd step : add the growth to the existing value of the dest channel
+        float dt = 1.0f / float(T);
+        float weighted_sum = (k.h / h_tot);
+
+        switch (k.dest_channel)
+        {
+        case 0:
+            c_tdt_x = p1[index].x + dt * weighted_sum * g_t;
+            break;
+        case 1:
+            c_tdt_y = p1[index].y + dt * weighted_sum * g_t;
+            break;
+        default:
+            c_tdt_z = p1[index].z + dt * weighted_sum * g_t;
+            break;
+        }
+    }
+
+
+    // 4th step : clip the result to be in range from 0 to 1
+    if (c_tdt_x < 0.0f) c_tdt_x = 0.0f;
+    if (c_tdt_x > 1.0f) c_tdt_x = 1.0f;
+    if (c_tdt_y < 0.0f) c_tdt_y = 0.0f;
+    if (c_tdt_y > 1.0f) c_tdt_y = 1.0f;
+    if (c_tdt_z < 0.0f) c_tdt_z = 0.0f;
+    if (c_tdt_z > 1.0f) c_tdt_z = 1.0f;
+
+    // assign the value
+    p2[index].x = c_tdt_x;
+    p2[index].y = c_tdt_y;
+    p2[index].z = c_tdt_z;
+    p2[index].w = 1.0f;
+}
+
+
 __host__ void lenia_extended_CPU(float4* p1, float4* p2)
 {
     // for each pixel
@@ -651,6 +749,53 @@ __host__ void lenia_extended_CPU(float4* p1, float4* p2)
         }
     }
 }
+
+__global__ void lenia_ext_gpu(float4* p1, float4* p2, float4* cuPixels, Noyau kernel0, Noyau kernel1, Noyau kernel2)
+{
+    int i = threadIdx.y + blockIdx.y * blockDim.y;
+    int j = threadIdx.x + blockIdx.x * blockDim.x;
+    int index = i * width_grid + j;
+
+    if (i < height_grid && j < width_grid) {
+        computeExtendedLeniaGpu(i, j, p1, p2, kernel0, kernel1, kernel2);
+        cuPixels[index] = p2[index];
+        //printf("cuPixel : (%f,%f,%f)\n", cuPixels[index].x, cuPixels[index].y, cuPixels[index].z);
+    }
+}
+
+void lenia_extended_GPU()
+{
+    dim3 dimBlock(block_dim_x, block_dim_y);
+    dim3 dimGrid(grid_dim_x, grid_dim_y);
+
+    cudaError_t err;
+
+    //OpenGL interoperability
+    cudaGraphicsMapResources(1, &cuBuffer, 0);
+    float4* cuPixels;
+    size_t num_bytes;
+    cudaGraphicsResourceGetMappedPointer((void**)&cuPixels, &num_bytes, cuBuffer);
+
+    // do treatments
+    if (tab_1_used) {
+        lenia_ext_gpu << < dimGrid, dimBlock >> > (d_grid1, d_grid2, cuPixels, kernel0, kernel1, kernel2);
+    }
+    else {
+        lenia_ext_gpu << < dimGrid, dimBlock >> > (d_grid2, d_grid1, cuPixels, kernel0, kernel1, kernel2);
+    }
+
+    cudaGraphicsUnmapResources(1, &cuBuffer);
+
+    cudaDeviceSynchronize();
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+
+
+// --------------------------------------------------- RENDERING --------------------------------------------------------------------------
 
 
 void calculate() {
@@ -665,6 +810,7 @@ void calculate() {
         case CPU_MODE: m = "CPU mode"; break;
         case GPU_MODE: m = "GPU mode"; break;
         case CPU_EXT_MODE: m = "CPU extended mode"; break;
+        case GPU_EXT_MODE: m = "GPU extended mode"; break;
         }
         sprintf(t, "%s:  %s, %.2f FPS", TITLE, m, frame * 1000 / (float)(timecur - timebase));
         glutSetWindowTitle(t);
@@ -684,6 +830,9 @@ void calculate() {
         break;
     case GPU_MODE:
         lenia_basic_GPU();
+        break;
+    case GPU_EXT_MODE:
+        lenia_extended_GPU();
         break;
     }
 }
@@ -800,6 +949,7 @@ void clean()
     case CPU_MODE: cleanCPU(); break;
     case GPU_MODE: cleanGPU(); break;
     case CPU_EXT_MODE: cleanExtendedCPU(); break;
+    case GPU_EXT_MODE: cleanExtendedGPU(); break;
     }
 
 }
@@ -822,6 +972,7 @@ void init()
     case CPU_MODE: initCPU(); break;
     case GPU_MODE: initGPU(); break;
     case CPU_EXT_MODE: initExtendedCPU(); break;
+    case GPU_EXT_MODE: initExtendedGPU(); break;
     }
 }
 
@@ -856,6 +1007,7 @@ void processNormalKeys(unsigned char key, int x, int y) {
     else if (key == '1') toggleMode(CPU_MODE);
     else if (key == '2') toggleMode(GPU_MODE);
     else if (key == '3') toggleMode(CPU_EXT_MODE);
+    else if (key == '4') toggleMode(GPU_EXT_MODE);
     else if (key == 'k') show_kernel = !show_kernel;
 }
 
