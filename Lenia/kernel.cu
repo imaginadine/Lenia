@@ -58,7 +58,7 @@ float* debug;
 float scale = 0.003f;
 float mx = 0.f;
 float my = 0.f;
-int mode = CPU_MODE;
+int mode = GPU_MODE;
 int frame = 0;
 int timebase = 0;
 
@@ -78,6 +78,8 @@ int size;
 float* n_kernel;
 float k_s_norm;
 float beta[B];
+float* ks_tab;
+float* d_ks_tab;
 __constant__ float cm_beta[B];
 
 #define checkCudaErrors(err) __checkCudaErrors(err, __FILE__, __LINE__)
@@ -187,6 +189,7 @@ void cleanCPU()
     free(lenia_pixels);
     free(lenia_pixels2);
     free(n_kernel);
+    free(ks_tab);
 }
 
 
@@ -198,8 +201,10 @@ void cleanGPU()
     glDeleteBuffers(1, &glBuffer);
 
     free(n_kernel);
+    free(ks_tab);
     cudaFree(d_grid1);
     cudaFree(d_grid2);
+    cudaFree(d_ks_tab);
 }
 
 // ------------------------- LENIA -------------------------------------------------------------------------------------
@@ -336,6 +341,25 @@ __host__ float init_k_s_norm() {
     return acc;
 }
 
+__host__ void init_ks_tab()
+{
+    int w = (2 * R + 1);
+    ks_tab = (float*)malloc(w * w * sizeof(float));
+
+    for (int i = -R; i <= R; i++)
+    {
+        for (int j = -R; j <= R; j++)
+        {
+            int ni = (i + w) % w;
+            int nj = (j + w) % w;
+            ks_tab[ni * w + nj] = 0;
+            float r = sqrtf(i * i + j * j) / R;
+            if (r <= 1.0f) {  // within the radius
+                ks_tab[ni * w + nj] = kernel_shell(r, beta);
+            }
+        }
+    }
+}
 
 void initCPU()
 {
@@ -350,7 +374,7 @@ void initCPU()
     lenia_pixels2 = zeroPixels();
 
     init_kernel();
-
+    init_ks_tab();
     k_s_norm = init_k_s_norm();
 }
 
@@ -374,6 +398,9 @@ void initGPU()
     checkCudaErrors(cudaMemcpy(d_grid1, lenia_pixels, size, cudaMemcpyHostToDevice));
 
     init_kernel();
+    init_ks_tab();
+    checkCudaErrors(cudaMalloc((void**)&d_ks_tab, (2 * R + 1) * (2 * R + 1) * sizeof(float)));
+    checkCudaErrors(cudaMemcpy(d_ks_tab, ks_tab, (2 * R + 1) * (2 * R + 1) * sizeof(float), cudaMemcpyHostToDevice));
 
     k_s_norm = init_k_s_norm();
 }
@@ -384,8 +411,9 @@ void initGPU()
     Pre-condition : in the grid at indexes x and y
     Post-condition : return value between 0 and 1
 */
-__host__ __device__ float potential_distribution(int x, int y, float4 d_grid_old[], float k_s_norm, float beta[], int width, int height) {
+__host__ __device__ float potential_distribution(int x, int y, float4 d_grid_old[], float k_s_norm, float beta[], int width, int height, float ks_tab[]) {
 
+    int w = (2 * R + 1);
     float sum = 0.0f;
     for (int i = -R; i <= R; i++)
     {
@@ -393,10 +421,11 @@ __host__ __device__ float potential_distribution(int x, int y, float4 d_grid_old
         {
             int ni = (x + i + height) % height;
             int nj = (y + j + width) % width;
+            int wi = (i + w) % w;
+            int wj = (j + w) % w;
             float r = sqrtf(i * i + j * j) / R;
             if (r <= 1.0f) {  // within the radius
-                //float grid_value = d_grid_old[ni * width + nj].y;
-                sum += kernel_shell(r, beta) * d_grid_old[ni * width + nj].y;
+                sum += ks_tab[wi * w + wj] * d_grid_old[ni * width + nj].y;
             }
         }
     }
@@ -404,13 +433,13 @@ __host__ __device__ float potential_distribution(int x, int y, float4 d_grid_old
     return sum / k_s_norm;
 }
 
-__host__ __device__ void computeLenia(int i, int j, float4* p1, float4* p2, float k_s_norm, float* beta) {
+__host__ __device__ void computeLenia(int i, int j, float4* p1, float4* p2, float k_s_norm, float* beta, float* ks_tab) {
     int index = i * width_grid + j;
     float c_t = p1[index].y; // field C at time step t
     float c_tdt; // field C at time step t + delta(t) ; (delta (t) = 1/T)
 
     // 1st step : convolution operation, multiplication with the kernel
-    float u_t = potential_distribution(i, j, p1, k_s_norm, beta, width_grid, height_grid);
+    float u_t = potential_distribution(i, j, p1, k_s_norm, beta, width_grid, height_grid, ks_tab);
     // 2nd step : growth mapping
     float g_t = growth_function_exp(u_t);
     // 3rd step : add the growth to the existing value
@@ -432,20 +461,20 @@ __host__ void lenia_basic_CPU(float4* p1, float4* p2)
     // for each pixel
     for (int i = 0; i < height_grid; i++) {
         for (int j = 0; j < width_grid; j++) {
-            computeLenia(i, j, p1, p2, k_s_norm, beta);
+            computeLenia(i, j, p1, p2, k_s_norm, beta, ks_tab);
         }
     }
 }
 
 
-__global__ void lenia_gpu(float4* p1, float4* p2, float4* cuPixels, float k_s_norm)
+__global__ void lenia_gpu(float4* p1, float4* p2, float4* cuPixels, float k_s_norm, float* d_ks_tab)
 {
     int i = threadIdx.y + blockIdx.y * blockDim.y;
     int j = threadIdx.x + blockIdx.x * blockDim.x;
     int index = i * width_grid + j;
 
     if (i < height_grid && j < width_grid) {
-        computeLenia(i, j, p1, p2, k_s_norm, cm_beta);
+        computeLenia(i, j, p1, p2, k_s_norm, cm_beta, d_ks_tab);
         cuPixels[index] = p2[index];
     }
 }
@@ -466,10 +495,10 @@ void lenia_basic_GPU()
 
     // do treatments
     if (tab_1_used) {
-        lenia_gpu << <dimGrid, dimBlock >> > (d_grid1, d_grid2, cuPixels, k_s_norm);
+        lenia_gpu << <dimGrid, dimBlock >> > (d_grid1, d_grid2, cuPixels, k_s_norm, d_ks_tab);
     }
     else {
-        lenia_gpu << <dimGrid, dimBlock >> > (d_grid2, d_grid1, cuPixels, k_s_norm);
+        lenia_gpu << <dimGrid, dimBlock >> > (d_grid2, d_grid1, cuPixels, k_s_norm, d_ks_tab);
     }
 
     cudaGraphicsUnmapResources(1, &cuBuffer);
